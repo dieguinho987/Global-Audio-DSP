@@ -1,0 +1,260 @@
+
+name: Global Audio DSP - Cloud Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: custom
+
+      - name: Select Xcode 27
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_APP="$(find /Applications -maxdepth 1 -type d -name 'Xcode_27*.app' | head -1)"
+          if [ -z "$XCODE_APP" ]; then
+            echo "::error::Xcode 27 not available on this runner."
+            ls /Applications | grep Xcode || true
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Download iOS 27 Media Device base
+        run: |
+          git clone --depth 1 https://github.com/satomasahiro2005/ios27-media-device-passthrough.git base
+
+      - name: Apply Custom Extreme DSP
+        shell: bash
+        run: |
+          cat > base/Sources/App/LowPass.swift <<'SWIFT'
+          import Darwin
+
+          private struct DSPBiquad {
+              var b0: Float = 1, b1: Float = 0, b2: Float = 0
+              var a1: Float = 0, a2: Float = 0
+              var z1: Float = 0, z2: Float = 0
+
+              mutating func set(_ b0: Float, _ b1: Float, _ b2: Float,
+                                _ a0: Float, _ a1: Float, _ a2: Float) {
+                  guard a0.isFinite, abs(a0) > 0.000001 else {
+                      reset()
+                      return
+                  }
+                  self.b0 = b0/a0
+                  self.b1 = b1/a0
+                  self.b2 = b2/a0
+                  self.a1 = a1/a0
+                  self.a2 = a2/a0
+              }
+
+              mutating func reset() { z1 = 0; z2 = 0 }
+
+              @inline(__always) mutating func process(_ x: Float) -> Float {
+                  let y = b0*x + z1
+                  z1 = b1*x - a1*y + z2
+                  z2 = b2*x - a2*y
+                  return y.isFinite ? y : 0
+              }
+
+              mutating func highPass(_ hz: Float, _ sr: Float) {
+                  let w = 2*Float.pi*min(hz,sr*0.4)/sr
+                  let c = cosf(w), a = sinf(w)/(2*0.7071)
+                  set((1+c)/2,-(1+c),(1+c)/2,1+a,-2*c,1-a)
+              }
+
+              mutating func lowPass(_ hz: Float, _ sr: Float) {
+                  let w = 2*Float.pi*min(hz,sr*0.4)/sr
+                  let c = cosf(w), a = sinf(w)/(2*0.7071)
+                  set((1-c)/2,1-c,(1-c)/2,1+a,-2*c,1-a)
+              }
+
+              mutating func peak(_ hz: Float, _ sr: Float,
+                                 _ db: Float, _ q: Float) {
+                  let a = powf(10,db/40)
+                  let w = 2*Float.pi*min(hz,sr*0.4)/sr
+                  let c = cosf(w), alpha = sinf(w)/(2*q)
+                  set(1+alpha*a,-2*c,1-alpha*a,
+                      1+alpha/a,-2*c,1-alpha/a)
+              }
+
+              mutating func shelf(_ hz: Float, _ sr: Float,
+                                  _ db: Float, high: Bool) {
+                  let a = powf(10,db/40)
+                  let w = 2*Float.pi*min(hz,sr*0.4)/sr
+                  let c = cosf(w), alpha = sinf(w)*0.5*sqrtf(2)
+                  let ap = a+1, am = a-1
+                  let beta = 2*sqrtf(a)*alpha
+                  if high {
+                      set(a*(ap+am*c+beta),-2*a*(am+ap*c),
+                          a*(ap+am*c-beta),ap-am*c+beta,
+                          2*(am-ap*c),ap-am*c-beta)
+                  } else {
+                      set(a*(ap-am*c+beta),2*a*(am-ap*c),
+                          a*(ap-am*c-beta),ap+am*c+beta,
+                          -2*(am+ap*c),ap+am*c-beta)
+                  }
+              }
+          }
+
+          final class LowPass {
+              private let target: UnsafeMutablePointer<Float>
+              private var cutoff: Float = 20000
+              private var rate: Float = 48000
+              private var hpL = DSPBiquad(), hpR = DSPBiquad()
+              private var bassL = DSPBiquad(), bassR = DSPBiquad()
+              private var midL = DSPBiquad(), midR = DSPBiquad()
+              private var airL = DSPBiquad(), airR = DSPBiquad()
+              private var lpL = DSPBiquad(), lpR = DSPBiquad()
+              private var envelope: Float = 0
+
+              init(cutoff: Float = 20000) {
+                  target = .allocate(capacity: 1)
+                  target.initialize(to: cutoff)
+                  configure(48000)
+              }
+
+              deinit { target.deallocate() }
+
+              var cutoff: Float {
+                  get { target.pointee }
+                  set {
+                      target.pointee = newValue.isFinite
+                          ? min(max(newValue,200),20000) : 20000
+                  }
+              }
+
+              private func configure(_ sr: Float) {
+                  rate = max(sr,8000)
+                  hpL.highPass(105,rate); hpR.highPass(105,rate)
+                  bassL.shelf(170,rate,3.5,high:false)
+                  bassR.shelf(170,rate,3.5,high:false)
+                  midL.peak(2800,rate,2.0,0.85)
+                  midR.peak(2800,rate,2.0,0.85)
+                  airL.shelf(8500,rate,1.2,high:true)
+                  airR.shelf(8500,rate,1.2,high:true)
+                  lpL.lowPass(cutoff,rate); lpR.lowPass(cutoff,rate)
+              }
+
+              func reset() {
+                  hpL.reset(); hpR.reset()
+                  bassL.reset(); bassR.reset()
+                  midL.reset(); midR.reset()
+                  airL.reset(); airR.reset()
+                  lpL.reset(); lpR.reset()
+                  envelope = 0
+                  cutoff = target.pointee
+              }
+
+              @inline(__always) private func saturate(_ x: Float) -> Float {
+                  tanhf(x*1.55)/tanhf(1.55)
+              }
+
+              func process(_ planar: UnsafeMutablePointer<Float>,
+                           frames: Int, sampleRate sr: Float) {
+                  guard frames > 0, sr.isFinite, sr > 0 else { return }
+                  if abs(sr-rate) > 1 { configure(sr) }
+
+                  let wanted = min(max(target.pointee,200),rate*0.44)
+                  cutoff += (wanted-cutoff)*0.20
+                  if !cutoff.isFinite { cutoff = wanted }
+                  lpL.lowPass(cutoff,rate)
+                  lpR.lowPass(cutoff,rate)
+
+                  let left = planar
+                  let right = planar.advanced(by:frames)
+
+                  for i in 0..<frames {
+                      var l = hpL.process(left[i])
+                      var r = hpR.process(right[i])
+                      l = bassL.process(l); r = bassR.process(r)
+                      l = midL.process(l); r = midR.process(r)
+                      l = airL.process(l); r = airR.process(r)
+                      l = lpL.process(l); r = lpR.process(r)
+
+                      let peak = max(abs(l),abs(r))
+                      let speed: Float = peak > envelope ? 0.18 : 0.003
+                      envelope += (peak-envelope)*speed
+
+                      var gain: Float = 1
+                      if envelope > 0.58 {
+                          gain = powf(0.58/max(envelope,0.0001),0.32)
+                      }
+
+                      l = saturate(l*gain*1.06)
+                      r = saturate(r*gain*1.06)
+
+                      let mid = (l+r)*0.5
+                      let side = (l-r)*0.5*1.08
+                      left[i] = min(max(mid+side,-0.88),0.88)
+                      right[i] = min(max(mid-side,-0.88),0.88)
+                  }
+              }
+          }
+          SWIFT
+
+      - name: Set unique bundle identifiers
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          files = [
+              Path("base/project.yml"),
+              Path("base/Sources/Extension/Extension.entitlements"),
+              Path("base/Sources/Extension/Info.plist"),
+              Path("base/Sources/Extension/PassthroughExtension.swift"),
+          ]
+          for p in files:
+              s = p.read_text()
+              s = s.replace(
+                  "media-device-protocol.ai.nemut.mdepass",
+                  "media-device-protocol.com.diego.globalaudiodsp"
+              )
+              s = s.replace(
+                  "ai.nemut.mdepass",
+                  "com.diego.globalaudiodsp"
+              )
+              p.write_text(s)
+          PY
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: base
+        run: xcodegen generate --spec project.yml
+
+      - name: Compile for iPhone
+        working-directory: base
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project MDEPassthrough.xcodeproj \
+            -scheme MDEPassthrough \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CONFIGURATION_BUILD_DIR="$RUNNER_TEMP/GlobalAudioDSPBuild" \
+            build | tee "$RUNNER_TEMP/build.log"
+
+      - name: Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Global-Audio-DSP-unsigned-build
+          path: ${{ runner.temp }}/GlobalAudioDSPBuild/MDEPassthrough.app
+          if-no-files-found: error
+          retention-days: 7
