@@ -112,7 +112,7 @@ jobs:
 
           final class LowPass {
               private let target: UnsafeMutablePointer<Float>
-              private var cutoff: Float = 20000
+              private var smoothedCutoff: Float = 20000
               private var rate: Float = 48000
               private var hpL = DSPBiquad(), hpR = DSPBiquad()
               private var bassL = DSPBiquad(), bassR = DSPBiquad()
@@ -146,7 +146,7 @@ jobs:
                   midR.peak(2800,rate,2.0,0.85)
                   airL.shelf(8500,rate,1.2,high:true)
                   airR.shelf(8500,rate,1.2,high:true)
-                  lpL.lowPass(cutoff,rate); lpR.lowPass(cutoff,rate)
+                  lpL.lowPass(smoothedCutoff,rate); lpR.lowPass(smoothedCutoff,rate)
               }
 
               func reset() {
@@ -156,7 +156,7 @@ jobs:
                   airL.reset(); airR.reset()
                   lpL.reset(); lpR.reset()
                   envelope = 0
-                  cutoff = target.pointee
+                  smoothedCutoff = target.pointee
               }
 
               @inline(__always) private func saturate(_ x: Float) -> Float {
@@ -169,10 +169,10 @@ jobs:
                   if abs(sr-rate) > 1 { configure(sr) }
 
                   let wanted = min(max(target.pointee,200),rate*0.44)
-                  cutoff += (wanted-cutoff)*0.20
-                  if !cutoff.isFinite { cutoff = wanted }
-                  lpL.lowPass(cutoff,rate)
-                  lpR.lowPass(cutoff,rate)
+                  smoothedCutoff += (wanted-smoothedCutoff)*0.20
+                  if !smoothedCutoff.isFinite { smoothedCutoff = wanted }
+                  lpL.lowPass(smoothedCutoff,rate); 
+                  lpR.lowPass(smoothedCutoff,rate)
 
                   let left = planar
                   let right = planar.advanced(by:frames)
